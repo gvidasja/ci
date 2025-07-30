@@ -1,0 +1,13 @@
+[Unit]
+Description=__SERVICE__ systemd service
+After=network.target
+
+[Service]
+ExecStart=/bin/bash /home/__USER__/__SERVICE__/start.sh
+WorkingDirectory=/home/__USER__/__SERVICE__
+Restart=always
+RestartSec=3
+User=__USER__
+
+[Install]
+WantedBy=multi-user.target

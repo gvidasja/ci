@@ -1,0 +1,112 @@
+name: 'Deploy systemd service to Debian instance'
+description: 'Deploys service files, systemd service, nginx config, certbot, and restarts service.'
+
+inputs:
+  service_name:
+    description: 'Name of the systemd service'
+    required: true
+  domain:
+    description: 'Domain for nginx and certbot'
+    required: true
+  port:
+    description: 'Port number exposed by the service (default: 12345)'
+    required: false
+    default: '12345'
+  deploy_key:
+    required: true
+  deploy_host:
+    required: true
+  deploy_user:
+    required: false
+    default: gvidasja
+  deploy_email:
+    required: true
+  env_file:
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout the repo
+      uses: actions/checkout@v4
+
+    - name: Setup SSH key
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ inputs.deploy_key }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H "${{ inputs.deploy_host }}" >> ~/.ssh/known_hosts
+
+    - name: Prepare files
+      shell: bash
+      run: |
+        if [ -x ./build.sh ]; then
+          echo "Running build.sh"
+          ./.deploy/build.sh
+        else
+          echo "No build.sh found, copying all repo files to dist"
+          mkdir -p dist
+          rsync -av --files-from=<(git ls-files) --exclude='.deploy' ./ dist/
+        fi
+
+    - name: Prepare config files (service + nginx) with fallback templates
+      shell: bash
+      run: |
+        mkdir -p dist_config
+
+        # Copy service + nginx from repo if present
+        cp .deploy/service.service dist_config/ 2>/dev/null || true
+        cp .deploy/nginx.conf dist_config/ 2>/dev/null || true
+
+        # Use fallback templates if missing
+        if [ ! -f dist_config/service.service ]; then
+          cp ${{ github.action_path }}/templates/service.service dist_config/service.service
+          sed -i "s/__SERVICE__/${{ inputs.service_name }}/g" dist_config/service.service
+          sed -i "s/__USER__/${{ inputs.deploy_user }}/g" dist_config/service.service
+        fi
+
+        if [ ! -f dist_config/nginx.conf ]; then
+          cp ${{ github.action_path }}/templates/nginx.conf dist_config/nginx.conf
+          sed -i "s/__DOMAIN__/${{ inputs.domain }}/g" dist_config/nginx.conf
+          sed -i "s/__PORT__/${{ inputs.port }}/g" dist_config/nginx.conf
+        fi
+
+    - name: Sync runtime files to server
+      shell: bash
+      run: |
+        rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" ./dist/ "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}":/home/"${{ inputs.deploy_user }}"/"${{ inputs.service_name }}"/
+
+    - name: Upload .env to server (if env_file is set)
+      if: ${{ inputs.env_file != '' }}
+      shell: bash
+      run: |
+        echo "${{ inputs.env_file }}" | ssh ${{ inputs.deploy_user }}@${{ inputs.deploy_host }} \
+          "cat > /home/${{ inputs.deploy_user }}/${{ inputs.service_name }}/.env"
+
+    - name: Sync config files to server
+      shell: bash
+      run: |
+        rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" ./dist_config/ "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}":/tmp/deploy-config/
+
+    - name: Install service and nginx config + certbot on server
+      shell: bash
+      run: |
+        ssh "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}" << EOF
+          set -e
+          sudo install -m 644 /tmp/deploy-config/service.service /etc/systemd/system/${{ inputs.service_name }}.service
+          sudo mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+          sudo install -m 644 -C /tmp/deploy-config/nginx.conf /etc/nginx/sites-available/${{ inputs.domain }}.conf
+          sudo ln -sf /etc/nginx/sites-available/${{ inputs.domain }}.conf /etc/nginx/sites-enabled/
+
+          sudo systemctl daemon-reexec
+          sudo systemctl enable --now ${{ inputs.service_name }}
+          sudo systemctl restart ${{ inputs.service_name }}
+
+          sudo nginx -t
+
+          sudo certbot --nginx -d ${{ inputs.domain }} --non-interactive --agree-tos -m ${{ inputs.deploy_email }}
+
+          sudo systemctl reload nginx
+        EOF
