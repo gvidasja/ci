@@ -106,6 +106,32 @@ certbot-nginx`.
 | `env_file` | no | uploaded as `.env`, mode 600 |
 | `wireguard_config` | no | full `wg-quick` client config; omit if the runner already has LAN access |
 
+## Supply chain: pin, don't float
+
+This repo is public, so anyone can read it — that's fine, nothing here is
+secret (see below). But it also means don't reference it from a caller
+workflow as `@main`/`@master`: that's a mutable ref, so a future push here
+(compromised account, bad collaborator, etc.) would silently change what
+runs with your deploy secrets on the next job. Pin to a commit SHA instead,
+and bump it deliberately:
+
+```yaml
+- uses: gvidasja/ci/deploy@<commit-sha>  # not @main
+```
+
+Same reasoning is why `actions/checkout` inside this action is pinned to a
+SHA rather than the `v4` tag.
+
+## What's actually sensitive here (and what isn't)
+
+Nothing in this repo is a secret — it's a template. The real values
+(`deploy_key`, `wireguard_config`, `deploy_host_key`, `env_file`, etc.) live
+only in the *calling* repo's Settings → Secrets and are injected at job
+time; GitHub masks them in logs. What being public does expose is the
+*design* (paths, sudoers commands, that WireGuard/certbot/systemd are
+used) — treat that as public by construction (pinned host key + scoped
+sudoers above), not as something relying on obscurity.
+
 ## Example caller workflow
 
 ```yaml
@@ -113,7 +139,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: your-org/ci/deploy@main
+      - uses: gvidasja/ci/deploy@<commit-sha> # pin, don't float @main
         with:
           service_name: myservice
           deploy_host: 10.0.0.9
