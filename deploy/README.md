@@ -84,16 +84,19 @@ this service:
   /usr/bin/install -m 644 -C /tmp/deploy-config/nginx.conf /etc/nginx/sites-available/example.com.conf, \
   /usr/sbin/nginx -t, \
   /bin/systemctl reload nginx, \
-  /usr/bin/test -e /etc/letsencrypt/live/example.com/fullchain.pem, \
   /usr/bin/certbot --nginx -d example.com *
 ```
 
 `certbot --nginx` is the broadest line here (it can rewrite nginx config
-files via its plugin), so the action now checks
-`/etc/letsencrypt/live/<domain>/fullchain.pem` first and only invokes
-certbot when there's no certificate yet — subsequent deploys skip it
-entirely and just reload nginx. Renewal is handled by certbot's own
-installed timer, not by this action.
+files via its plugin), and it does run on every deploy — deliberately.
+Each deploy re-installs the bare, HTTP-only `nginx.conf` fallback template,
+and it's certbot's own *installer* step (not just cert issuance) that adds
+the `listen 443 ssl` block and the HTTP→HTTPS redirect back in. Skipping
+certbot when a cert already exists leaves that block missing and takes the
+site down over HTTPS — don't gate it on cert existence. certbot itself
+already no-ops the actual reissuance when the existing cert isn't due for
+renewal, so re-running it is cheap; ongoing renewal is additionally handled
+by certbot's own installed timer, independent of this action.
 
 On postmarketOS (Alpine-based) you'll first need `apk add openssh rsync
 sudo`, and, if you want nginx/certbot, `apk add nginx certbot

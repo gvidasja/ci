@@ -175,11 +175,13 @@ runs:
           sudo ln -sf /etc/nginx/sites-available/"$domain".conf /etc/nginx/sites-enabled/
           sudo nginx -t
 
-          if sudo test -e /etc/letsencrypt/live/"$domain"/fullchain.pem; then
-            echo "Certificate for $domain already exists — skipping certbot. Renewal is handled by certbot's own systemd timer, not this action."
-          else
-            sudo certbot --nginx -d "$domain" --non-interactive --agree-tos -m "$email"
-          fi
+          # Always run certbot, even when a cert already exists: the nginx.conf
+          # we just installed above is the bare HTTP-only template, and it's
+          # certbot's own installer step (not just cert issuance) that adds the
+          # `listen 443 ssl` block + redirect back in. certbot no-ops the actual
+          # reissuance itself if the existing cert isn't due for renewal, so
+          # this is cheap and self-healing rather than wasteful.
+          sudo certbot --nginx -d "$domain" --non-interactive --agree-tos -m "$email"
 
           sudo systemctl reload nginx
         EOF
