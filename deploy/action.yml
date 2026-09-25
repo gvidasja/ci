@@ -1,27 +1,40 @@
-name: 'Deploy systemd service to Debian instance'
-description: 'Deploys service files, systemd service, nginx config, certbot, and restarts service.'
+name: 'Deploy systemd service to a remote instance'
+description: 'Deploys service files, systemd service, and (optionally, when a domain is given) nginx + certbot, then restarts the service. Can bridge into a WireGuard-only LAN first.'
 
 inputs:
   service_name:
     description: 'Name of the systemd service'
     required: true
   domain:
-    description: 'Domain for nginx and certbot'
-    required: true
+    description: 'Public domain for nginx + certbot. Leave empty for a LAN-only device with no public DNS — nginx/certbot are skipped entirely.'
+    required: false
+    default: ''
   port:
     description: 'Port number exposed by the service (default: 12345)'
     required: false
     default: '12345'
   deploy_key:
+    description: 'SSH private key for deploy_user@deploy_host'
     required: true
   deploy_host:
+    description: 'Hostname or IP of the target — a public IP/hostname (e.g. a cloud VM) works directly; a LAN-only address needs wireguard_config first'
     required: true
+  deploy_host_key:
+    description: 'Pinned known_hosts line(s) for deploy_host (e.g. `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` run *on the device*). Strongly recommended. If empty, falls back to trust-on-first-use via ssh-keyscan.'
+    required: false
+    default: ''
   deploy_user:
     required: false
     default: gvidasja
   deploy_email:
-    required: true
+    description: 'Email for certbot registration. Required only when domain is set.'
+    required: false
+    default: ''
   env_file:
+    required: false
+    default: ''
+  wireguard_config:
+    description: 'Full wg-quick client config (as text) to bring up a tunnel into the target LAN before deploying. Leave empty if the runner already has network access (e.g. self-hosted runner already on the LAN).'
     required: false
     default: ''
 
@@ -31,18 +44,49 @@ runs:
     - name: Checkout the repo
       uses: actions/checkout@v4
 
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -n "${{ inputs.domain }}" ] && [ -z "${{ inputs.deploy_email }}" ]; then
+          echo "::error::deploy_email is required when domain is set (needed for certbot)."
+          exit 1
+        fi
+
+    - name: Connect to WireGuard
+      if: ${{ inputs.wireguard_config != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update -y
+        sudo apt-get install -y wireguard-tools
+        umask 077
+        echo "${{ inputs.wireguard_config }}" | sudo tee /etc/wireguard/ci-deploy.conf > /dev/null
+        sudo chmod 600 /etc/wireguard/ci-deploy.conf
+        sudo wg-quick up ci-deploy
+
     - name: Setup SSH key
       shell: bash
       run: |
+        set -euo pipefail
+        umask 077
         mkdir -p ~/.ssh
-        echo "${{ inputs.deploy_key }}" > ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
-        ssh-keyscan -H "${{ inputs.deploy_host }}" >> ~/.ssh/known_hosts
+        echo "${{ inputs.deploy_key }}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        touch ~/.ssh/known_hosts
+
+        if [ -n "${{ inputs.deploy_host_key }}" ]; then
+          echo "${{ inputs.deploy_host_key }}" >> ~/.ssh/known_hosts
+        else
+          echo "::warning::deploy_host_key not set — trusting the host key on first connect (TOFU). Set deploy_host_key to pin it and prevent MITM."
+          ssh-keyscan -H "${{ inputs.deploy_host }}" >> ~/.ssh/known_hosts
+        fi
 
     - name: Prepare files
       shell: bash
       run: |
-        if [ -x ./build.sh ]; then
+        set -euo pipefail
+        if [ -x ./.deploy/build.sh ]; then
           echo "Running build.sh"
           ./.deploy/build.sh
         else
@@ -54,59 +98,100 @@ runs:
     - name: Prepare config files (service + nginx) with fallback templates
       shell: bash
       run: |
+        set -euo pipefail
         mkdir -p dist_config
 
-        # Copy service + nginx from repo if present
+        # Copy service from repo if present
         cp .deploy/service.service dist_config/ 2>/dev/null || true
-        cp .deploy/nginx.conf dist_config/ 2>/dev/null || true
 
-        # Use fallback templates if missing
+        # Use fallback template if missing
         if [ ! -f dist_config/service.service ]; then
           cp ${{ github.action_path }}/templates/service.service dist_config/service.service
           sed -i "s/__SERVICE__/${{ inputs.service_name }}/g" dist_config/service.service
           sed -i "s/__USER__/${{ inputs.deploy_user }}/g" dist_config/service.service
         fi
 
-        if [ ! -f dist_config/nginx.conf ]; then
-          cp ${{ github.action_path }}/templates/nginx.conf dist_config/nginx.conf
-          sed -i "s/__DOMAIN__/${{ inputs.domain }}/g" dist_config/nginx.conf
-          sed -i "s/__PORT__/${{ inputs.port }}/g" dist_config/nginx.conf
+        # nginx is only relevant when we actually have a public domain
+        if [ -n "${{ inputs.domain }}" ]; then
+          cp .deploy/nginx.conf dist_config/ 2>/dev/null || true
+          if [ ! -f dist_config/nginx.conf ]; then
+            cp ${{ github.action_path }}/templates/nginx.conf dist_config/nginx.conf
+            sed -i "s/__DOMAIN__/${{ inputs.domain }}/g" dist_config/nginx.conf
+            sed -i "s/__PORT__/${{ inputs.port }}/g" dist_config/nginx.conf
+          fi
         fi
 
     - name: Sync runtime files to server
       shell: bash
       run: |
-        rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" ./dist/ "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}":/home/"${{ inputs.deploy_user }}"/"${{ inputs.service_name }}"/
+        set -euo pipefail
+        rsync -avz --delete -e "ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts" \
+          ./dist/ "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}":/home/"${{ inputs.deploy_user }}"/"${{ inputs.service_name }}"/
 
     - name: Upload .env to server (if env_file is set)
       if: ${{ inputs.env_file != '' }}
       shell: bash
       run: |
-        echo "${{ inputs.env_file }}" | ssh ${{ inputs.deploy_user }}@${{ inputs.deploy_host }} \
-          "cat > /home/${{ inputs.deploy_user }}/${{ inputs.service_name }}/.env"
+        set -euo pipefail
+        ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts \
+          "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}" \
+          "umask 177 && cat > /home/${{ inputs.deploy_user }}/${{ inputs.service_name }}/.env" <<< "${{ inputs.env_file }}"
 
     - name: Sync config files to server
       shell: bash
       run: |
-        rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" ./dist_config/ "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}":/tmp/deploy-config/
+        set -euo pipefail
+        rsync -avz --delete -e "ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts" \
+          ./dist_config/ "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}":/tmp/deploy-config/
 
-    - name: Install service and nginx config + certbot on server
+    - name: Install service on server
       shell: bash
       run: |
-        ssh "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}" << EOF
-          set -e
-          sudo install -m 644 /tmp/deploy-config/service.service /etc/systemd/system/${{ inputs.service_name }}.service
+        set -euo pipefail
+        ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts \
+          "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}" \
+          bash -s -- "${{ inputs.service_name }}" <<'EOF'
+          set -euo pipefail
+          service_name="$1"
+          sudo install -m 644 /tmp/deploy-config/service.service /etc/systemd/system/"$service_name".service
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now "$service_name"
+          sudo systemctl restart "$service_name"
+        EOF
+
+    - name: Install nginx config + certbot on server
+      if: ${{ inputs.domain != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts \
+          "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}" \
+          bash -s -- "${{ inputs.domain }}" "${{ inputs.deploy_email }}" <<'EOF'
+          set -euo pipefail
+          domain="$1"
+          email="$2"
           sudo mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-          sudo install -m 644 -C /tmp/deploy-config/nginx.conf /etc/nginx/sites-available/${{ inputs.domain }}.conf
-          sudo ln -sf /etc/nginx/sites-available/${{ inputs.domain }}.conf /etc/nginx/sites-enabled/
-
-          sudo systemctl daemon-reexec
-          sudo systemctl enable --now ${{ inputs.service_name }}
-          sudo systemctl restart ${{ inputs.service_name }}
-
+          sudo install -m 644 -C /tmp/deploy-config/nginx.conf /etc/nginx/sites-available/"$domain".conf
+          sudo ln -sf /etc/nginx/sites-available/"$domain".conf /etc/nginx/sites-enabled/
           sudo nginx -t
 
-          sudo certbot --nginx -d ${{ inputs.domain }} --non-interactive --agree-tos -m ${{ inputs.deploy_email }}
+          if sudo test -e /etc/letsencrypt/live/"$domain"/fullchain.pem; then
+            echo "Certificate for $domain already exists — skipping certbot. Renewal is handled by certbot's own systemd timer, not this action."
+          else
+            sudo certbot --nginx -d "$domain" --non-interactive --agree-tos -m "$email"
+          fi
 
           sudo systemctl reload nginx
         EOF
+
+    - name: Remove SSH key
+      if: always()
+      shell: bash
+      run: rm -f ~/.ssh/deploy_key
+
+    - name: Disconnect WireGuard
+      if: always() && inputs.wireguard_config != ''
+      shell: bash
+      run: |
+        sudo wg-quick down ci-deploy || true
+        sudo rm -f /etc/wireguard/ci-deploy.conf
