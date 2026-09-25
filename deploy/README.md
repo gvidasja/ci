@@ -6,6 +6,10 @@ GitHub-hosted runner.
 
 ## Reaching a LAN-only device (e.g. a postmarketOS phone)
 
+Skip this whole section for a publicly reachable target (e.g. a GCE VM) —
+just point `deploy_host` at its public IP and leave `wireguard_config`
+empty; the action SSHes straight to it like any other host.
+
 GitHub-hosted runners can't reach a device that only has a private LAN
 address. Since your router already exposes WireGuard, have the job join it
 for the duration of the deploy rather than:
@@ -42,23 +46,27 @@ network access to `deploy_host` (e.g. a self-hosted runner on the LAN).
 ## Pinning the host key
 
 Don't rely on `ssh-keyscan` alone (trust-on-first-use) — the action falls
-back to it with a warning, but a peer on the LAN could spoof `deploy_host`
-before the real first connection. Since it's your own phone, read the key
-directly off the device instead of over the network:
+back to it with a warning, but something on the network path could spoof
+`deploy_host` before the real first connection. Read the key from a
+channel that isn't the SSH connection itself:
 
 ```sh
-# on the phone
+# on the device
 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
 cat /etc/ssh/ssh_host_ed25519_key.pub
 ```
 
+On GCE, the host key fingerprints are also printed to the serial console
+log on first boot, so you can pull them without SSHing in blind:
+`gcloud compute instances get-serial-port-output <instance>`.
+
 Store `<deploy_host> ssh-ed25519 <key>` as the `deploy_host_key` secret.
 
-## Locking down sudo on the phone
+## Locking down sudo on the target
 
 The deploy user needs passwordless sudo for exactly the commands this
-action runs — not full sudo. On the phone (adjust `myservice`/paths to
-match your `service_name`/`domain`):
+action runs — not full sudo. On the target device (adjust `myservice`/paths
+to match your `service_name`/`domain`):
 
 ```
 # /etc/sudoers.d/ci-deploy-myservice
@@ -89,7 +97,8 @@ installed timer, not by this action.
 
 On postmarketOS (Alpine-based) you'll first need `apk add openssh rsync
 sudo`, and, if you want nginx/certbot, `apk add nginx certbot
-certbot-nginx`.
+certbot-nginx`. Debian/GCE images ship openssh/rsync already; nginx/certbot
+are `apt install nginx certbot python3-certbot-nginx`.
 
 ## Inputs
 
@@ -99,7 +108,7 @@ certbot-nginx`.
 | `domain` | no | Leave empty for LAN-only devices — nginx/certbot are skipped entirely. |
 | `port` | no | default `12345` |
 | `deploy_key` | yes | SSH private key |
-| `deploy_host` | yes | LAN IP works once `wireguard_config` is up |
+| `deploy_host` | yes | public IP/hostname works directly; LAN-only address needs `wireguard_config` first |
 | `deploy_host_key` | no (recommended) | pinned `known_hosts` line(s); falls back to TOFU `ssh-keyscan` with a warning |
 | `deploy_user` | no | default `gvidasja` |
 | `deploy_email` | required if `domain` set | for certbot |
@@ -123,3 +132,7 @@ jobs:
           env_file: ${{ secrets.APP_ENV }}
           # domain/deploy_email omitted — this is a LAN-only deploy
 ```
+
+For a publicly reachable target (e.g. GCE), drop `wireguard_config`, point
+`deploy_host` at the public IP, and add `domain`/`deploy_email` for nginx +
+certbot.

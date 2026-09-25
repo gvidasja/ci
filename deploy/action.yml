@@ -1,4 +1,4 @@
-name: 'Deploy systemd service to a Debian/postmarketOS instance'
+name: 'Deploy systemd service to a remote instance'
 description: 'Deploys service files, systemd service, and (optionally, when a domain is given) nginx + certbot, then restarts the service. Can bridge into a WireGuard-only LAN first.'
 
 inputs:
@@ -17,7 +17,7 @@ inputs:
     description: 'SSH private key for deploy_user@deploy_host'
     required: true
   deploy_host:
-    description: 'Hostname or IP of the target device (e.g. its LAN address, reachable once wireguard_config is up)'
+    description: 'Hostname or IP of the target — a public IP/hostname (e.g. a cloud VM) works directly; a LAN-only address needs wireguard_config first'
     required: true
   deploy_host_key:
     description: 'Pinned known_hosts line(s) for deploy_host (e.g. `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` run *on the device*). Strongly recommended. If empty, falls back to trust-on-first-use via ssh-keyscan.'
