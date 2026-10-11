@@ -1,5 +1,5 @@
 name: 'Deploy a systemd user service to a remote host'
-description: 'Builds/syncs the repo to a dedicated unprivileged account on the target and (re)starts it as a systemd user service — no sudo. Can bridge into a WireGuard-only LAN first.'
+description: 'Builds/syncs the repo to a dedicated unprivileged account on the target and (re)starts it as a systemd user service — no sudo. Can reach a LAN-only target through a Cloudflare Tunnel or WireGuard.'
 
 inputs:
   service_name:
@@ -9,7 +9,7 @@ inputs:
     description: 'SSH private key for deploy_user@deploy_host'
     required: true
   deploy_host:
-    description: 'Hostname or IP of the target — a public IP/hostname works directly; a LAN-only address needs wireguard_config first'
+    description: 'Hostname or IP of the target — a public IP/hostname works directly; a Cloudflare Tunnel hostname needs cf_access_client_id/secret; a LAN-only address needs wireguard_config'
     required: true
   deploy_host_key:
     description: 'Pinned known_hosts line(s) for deploy_host (`cat /etc/ssh/ssh_host_ed25519_key.pub` run *on the device*). Strongly recommended. If empty, falls back to trust-on-first-use via ssh-keyscan.'
@@ -25,6 +25,14 @@ inputs:
     default: ''
   wireguard_config:
     description: 'Full wg-quick client config (as text) to bring up a tunnel into the target LAN before deploying. Leave empty if the runner already has network access.'
+    required: false
+    default: ''
+  cf_access_client_id:
+    description: 'Cloudflare Access service token Client ID. When set (with cf_access_client_secret), SSH goes through `cloudflared access ssh` to deploy_host — a Cloudflare Tunnel hostname routed to the target''s sshd. Requires deploy_host_key.'
+    required: false
+    default: ''
+  cf_access_client_secret:
+    description: 'Cloudflare Access service token Client Secret'
     required: false
     default: ''
 
@@ -53,8 +61,39 @@ runs:
         sudo chmod 600 /etc/wireguard/ci-deploy.conf
         sudo wg-quick up ci-deploy
 
+    - name: Install cloudflared
+      if: ${{ inputs.cf_access_client_id != '' }}
+      shell: bash
+      env:
+        CF_SECRET: ${{ inputs.cf_access_client_secret }}
+        HOST_KEY: ${{ inputs.deploy_host_key }}
+      run: |
+        set -euo pipefail
+        if [ -z "$CF_SECRET" ]; then
+          echo "::error::cf_access_client_id is set but cf_access_client_secret is empty"
+          exit 1
+        fi
+        if [ -z "$HOST_KEY" ]; then
+          # ssh-keyscan can't go through a ProxyCommand, so there's no TOFU fallback here.
+          echo "::error::deploy_host_key is required with cf_access_client_id"
+          exit 1
+        fi
+        case "$(uname -m)" in
+          x86_64) arch=amd64 ;;
+          aarch64) arch=arm64 ;;
+          *) echo "::error::unsupported runner arch $(uname -m)"; exit 1 ;;
+        esac
+        mkdir -p ~/.local/bin
+        curl -fsSL -o ~/.local/bin/cloudflared \
+          "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch"
+        chmod +x ~/.local/bin/cloudflared
+        ~/.local/bin/cloudflared --version
+
     - name: Setup SSH key
       shell: bash
+      env:
+        CF_ID: ${{ inputs.cf_access_client_id }}
+        CF_SECRET: ${{ inputs.cf_access_client_secret }}
       run: |
         set -euo pipefail
         umask 077
@@ -62,6 +101,16 @@ runs:
         echo "${{ inputs.deploy_key }}" > ~/.ssh/deploy_key
         chmod 600 ~/.ssh/deploy_key
         touch ~/.ssh/known_hosts
+
+        # Dedicated config (ssh -F) so a self-hosted runner's ~/.ssh/config is left alone.
+        {
+          echo "Host ${{ inputs.deploy_host }}"
+          echo "  IdentityFile ~/.ssh/deploy_key"
+          echo "  UserKnownHostsFile ~/.ssh/known_hosts"
+          if [ -n "$CF_ID" ]; then
+            echo "  ProxyCommand $HOME/.local/bin/cloudflared access ssh --hostname %h --service-token-id $CF_ID --service-token-secret $CF_SECRET"
+          fi
+        } > ~/.ssh/deploy_config
 
         if [ -n "${{ inputs.deploy_host_key }}" ]; then
           echo "${{ inputs.deploy_host_key }}" >> ~/.ssh/known_hosts
@@ -99,7 +148,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        rsync -avz --delete -e "ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts" \
+        rsync -avz --delete -e "ssh -F $HOME/.ssh/deploy_config" \
           ./dist/ "$DEPLOY_USER@${{ inputs.deploy_host }}:${{ inputs.service_name }}/"
 
     - name: Upload .env to server (if env_file is set)
@@ -107,7 +156,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts \
+        ssh -F $HOME/.ssh/deploy_config \
           "$DEPLOY_USER@${{ inputs.deploy_host }}" \
           "umask 177 && cat > ${{ inputs.service_name }}/.env" <<< "${{ inputs.env_file }}"
 
@@ -115,14 +164,14 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        rsync -avz --delete -e "ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts" \
+        rsync -avz --delete -e "ssh -F $HOME/.ssh/deploy_config" \
           ./dist_config/ "$DEPLOY_USER@${{ inputs.deploy_host }}:.deploy-config/"
 
     - name: Install and restart user service
       shell: bash
       run: |
         set -euo pipefail
-        ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts \
+        ssh -F $HOME/.ssh/deploy_config \
           "$DEPLOY_USER@${{ inputs.deploy_host }}" \
           bash -s -- "${{ inputs.service_name }}" <<'EOF'
           set -euo pipefail
@@ -151,7 +200,7 @@ runs:
     - name: Remove SSH key
       if: always()
       shell: bash
-      run: rm -f ~/.ssh/deploy_key
+      run: rm -f ~/.ssh/deploy_key ~/.ssh/deploy_config
 
     - name: Disconnect WireGuard
       if: always() && inputs.wireguard_config != ''

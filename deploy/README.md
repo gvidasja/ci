@@ -53,8 +53,34 @@ just point `deploy_host` at its public IP and leave `wireguard_config`
 empty; the action SSHes straight to it like any other host.
 
 GitHub-hosted runners can't reach a device that only has a private LAN
-address. Since your router already exposes WireGuard, have the job join it
-for the duration of the deploy rather than:
+address. Two options, in order of preference.
+
+### Cloudflare Tunnel + Access (preferred)
+
+If the device already runs `cloudflared`, route a hostname on that tunnel to
+its sshd and gate it with an Access service token. The runner reaches only
+that one SSH port — nothing else on the LAN — and nothing on the router is
+involved.
+
+1. **Access app first** (so the hostname is never reachable unprotected):
+   Zero Trust → Access → Service Auth → create a service token. Then add a
+   self-hosted application for e.g. `ssh-device.example.com` with a single
+   policy: action **Service Auth**, include **Service Token** = that token.
+2. **Tunnel route:** on the device's tunnel add a Public Hostname
+   `ssh-device.example.com` → `ssh://localhost:22`.
+3. **Secrets:** `deploy_host` = that hostname, `deploy_host_key` =
+   `ssh-device.example.com ssh-ed25519 <key>` (required in this mode —
+   `ssh-keyscan` can't go through the tunnel), and the token's Client ID /
+   Secret as `cf_access_client_id` / `cf_access_client_secret`.
+
+The action downloads `cloudflared` (no sudo) and uses
+`cloudflared access ssh` as the SSH `ProxyCommand`. Leave `wireguard_config`
+empty.
+
+### WireGuard
+
+If your router exposes WireGuard, have the job join it for the duration of
+the deploy rather than:
 
 - **port-forwarding SSH to the phone** — puts an always-on Linux phone
   directly on the internet, don't do this;
@@ -115,11 +141,12 @@ Store `<deploy_host> ssh-ed25519 <key>` as the `deploy_host_key` secret.
 |---|---|---|
 | `service_name` | yes | unit name and `~/<service_name>/` dir |
 | `deploy_key` | yes | SSH private key of the service account |
-| `deploy_host` | yes | public IP/hostname works directly; LAN-only address needs `wireguard_config` |
+| `deploy_host` | yes | public IP/hostname works directly; tunnel hostname needs `cf_access_*`; LAN-only address needs `wireguard_config` |
 | `deploy_host_key` | no (recommended) | pinned `known_hosts` line(s); falls back to TOFU `ssh-keyscan` with a warning |
 | `deploy_user` | no | defaults to `service_name` |
 | `env_file` | no | uploaded as `~/<service_name>/.env`, mode 600 |
 | `wireguard_config` | no | full `wg-quick` client config; omit if the runner already reaches the host |
+| `cf_access_client_id` / `cf_access_client_secret` | no | Cloudflare Access service token; SSH via `cloudflared access ssh`. Requires `deploy_host_key` |
 
 ## Example caller workflow
 
@@ -135,5 +162,8 @@ jobs:
           deploy_host_key: ${{ secrets.DEPLOY_HOST_KEY }}
           deploy_key: ${{ secrets.DEPLOY_KEY }}
           env_file: ${{ secrets.ENV_FILE }}
-          # wireguard_config: ${{ secrets.WIREGUARD_CONFIG }}   # LAN-only targets
+          # LAN-only targets, one of:
+          # cf_access_client_id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          # cf_access_client_secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          # wireguard_config: ${{ secrets.WIREGUARD_CONFIG }}
 ```
