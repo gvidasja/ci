@@ -40,6 +40,11 @@ should route to your phone, not tunnel *all* its traffic through your home
 IP. Give this WireGuard peer its own keypair (don't reuse your personal
 laptop's), so you can revoke CI's access independently.
 
+`AllowedIPs` only limits what the *runner* routes; whoever holds the config
+can change it. If your router supports it, also firewall the CI peer to just
+the target's SSH port (e.g. `<target-ip>:22`), so a leaked config doesn't
+open the rest of your LAN.
+
 If you omit `wireguard_config`, the action assumes the runner already has
 network access to `deploy_host` (e.g. a self-hosted runner on the LAN).
 
@@ -62,7 +67,40 @@ log on first boot, so you can pull them without SSHing in blind:
 
 Store `<deploy_host> ssh-ed25519 <key>` as the `deploy_host_key` secret.
 
-## Locking down sudo on the target
+## Running without sudo (`user_service: true`) — preferred
+
+The safest setup gives CI no root at all: run the app as a systemd *user*
+service of a dedicated, unprivileged account. A leaked deploy key or a
+malicious commit then reaches only that account, not root and not your own
+login account.
+
+One-time, as root on the target (`myservice` = `service_name` = the account):
+
+```sh
+useradd -m -s /bin/sh myservice      # Alpine/postmarketOS: adduser -D -s /bin/sh myservice
+usermod -p '*' myservice             # no password, but not "locked" (sshd refuses locked accounts)
+loginctl enable-linger myservice     # keep its services running without a login session
+install -d -m 700 -o myservice -g myservice ~myservice/.ssh
+echo 'restrict ssh-ed25519 AAAA... ci-deploy' > ~myservice/.ssh/authorized_keys
+chown myservice: ~myservice/.ssh/authorized_keys && chmod 600 ~myservice/.ssh/authorized_keys
+```
+
+Don't add the account to `sudo`/`wheel`. `restrict` disables port, agent and
+X11 forwarding and PTYs for the CI key; rsync and plain commands still work.
+
+Then pass `deploy_user: myservice` and `user_service: true`. The unit goes to
+`~/.config/systemd/user/<service_name>.service` (repo's `.deploy/service.service`
+must then be a user unit: no `User=`, `WantedBy=default.target`; the fallback
+template already is). Keep state such as a sqlite db in the account's home,
+outside the deployed dir.
+
+`user_service` cannot be combined with `domain` (nginx/certbot need root).
+For a public site, set up nginx + certbot once by hand to proxy the domain to
+the app's port; certbot's timer handles renewals, so CI never needs to touch
+it again. Alternatively, expose the app with a tunnel (e.g. Cloudflare Tunnel)
+and skip nginx entirely.
+
+## Locking down sudo on the target (system services)
 
 The deploy user needs passwordless sudo for exactly the commands this
 action runs — not full sudo. On the target device (adjust `myservice`/paths
@@ -117,6 +155,7 @@ are `apt install nginx certbot python3-certbot-nginx`.
 | `deploy_email` | required if `domain` set | for certbot |
 | `env_file` | no | uploaded as `.env`, mode 600 |
 | `wireguard_config` | no | full `wg-quick` client config; omit if the runner already has LAN access |
+| `user_service` | no | `true` = systemd user service of `deploy_user`, no sudo (see above); not with `domain` |
 
 ## Example caller workflow
 

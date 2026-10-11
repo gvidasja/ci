@@ -37,6 +37,10 @@ inputs:
     description: 'Full wg-quick client config (as text) to bring up a tunnel into the target LAN before deploying. Leave empty if the runner already has network access (e.g. self-hosted runner already on the LAN).'
     required: false
     default: ''
+  user_service:
+    description: "'true' installs the unit as a systemd user service of deploy_user (needs `loginctl enable-linger` once) — no sudo at all. Cannot be combined with domain: set up nginx once by hand instead."
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
@@ -50,6 +54,10 @@ runs:
         set -euo pipefail
         if [ -n "${{ inputs.domain }}" ] && [ -z "${{ inputs.deploy_email }}" ]; then
           echo "::error::deploy_email is required when domain is set (needed for certbot)."
+          exit 1
+        fi
+        if [ "${{ inputs.user_service }}" = "true" ] && [ -n "${{ inputs.domain }}" ]; then
+          echo "::error::user_service cannot manage nginx/certbot (needs root). Leave domain empty and set up nginx once by hand."
           exit 1
         fi
 
@@ -105,7 +113,10 @@ runs:
         cp .deploy/service.service dist_config/ 2>/dev/null || true
 
         # Use fallback template if missing
-        if [ ! -f dist_config/service.service ]; then
+        if [ ! -f dist_config/service.service ] && [ "${{ inputs.user_service }}" = "true" ]; then
+          cp ${{ github.action_path }}/templates/user.service dist_config/service.service
+          sed -i "s/__SERVICE__/${{ inputs.service_name }}/g" dist_config/service.service
+        elif [ ! -f dist_config/service.service ]; then
           cp ${{ github.action_path }}/templates/service.service dist_config/service.service
           sed -i "s/__SERVICE__/${{ inputs.service_name }}/g" dist_config/service.service
           sed -i "s/__USER__/${{ inputs.deploy_user }}/g" dist_config/service.service
@@ -141,10 +152,14 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # user mode: a per-user dir, since several deploy users may share the host
+        dest=/tmp/deploy-config/
+        if [ "${{ inputs.user_service }}" = "true" ]; then dest=.deploy-config/; fi
         rsync -avz --delete -e "ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts" \
-          ./dist_config/ "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}":/tmp/deploy-config/
+          ./dist_config/ "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}":"$dest"
 
     - name: Install service on server
+      if: ${{ inputs.user_service != 'true' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -157,6 +172,30 @@ runs:
           sudo systemctl daemon-reload
           sudo systemctl enable --now "$service_name"
           sudo systemctl restart "$service_name"
+        EOF
+
+    - name: Install user service on server
+      if: ${{ inputs.user_service == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        ssh -i ~/.ssh/deploy_key -o UserKnownHostsFile=~/.ssh/known_hosts \
+          "${{ inputs.deploy_user }}"@"${{ inputs.deploy_host }}" \
+          bash -s -- "${{ inputs.service_name }}" <<'EOF'
+          set -euo pipefail
+          service_name="$1"
+          if [ "$(loginctl show-user "$(id -un)" -p Linger --value)" != "yes" ]; then
+            echo "::error::Linger is off for $(id -un): the service would stop at logout. Run once as root: loginctl enable-linger $(id -un)"
+            exit 1
+          fi
+          # Non-PAM SSH sessions may lack these; the user manager's bus lives here under linger.
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+          mkdir -p ~/.config/systemd/user
+          install -m 644 ~/.deploy-config/service.service ~/.config/systemd/user/"$service_name".service
+          systemctl --user daemon-reload
+          systemctl --user enable --now "$service_name"
+          systemctl --user restart "$service_name"
         EOF
 
     - name: Install nginx config + certbot on server
