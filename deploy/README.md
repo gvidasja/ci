@@ -1,8 +1,50 @@
 # Deploy action
 
-Deploys a repo's build output + a systemd unit (and, optionally, nginx +
-certbot when a public `domain` is set) to a remote device over SSH, from a
-GitHub-hosted runner.
+Deploys a repo's build output to a remote host over SSH (from a GitHub-hosted
+runner) and runs it as a **systemd user service of a dedicated, unprivileged
+account**. CI never gets sudo: a leaked deploy key or a malicious commit
+reaches only that one account — not root, not your own login account.
+
+## One-time target setup (as root)
+
+Per service (`myservice` = `service_name` = the account name):
+
+```sh
+useradd -m -s /bin/sh myservice      # Alpine/postmarketOS: adduser -D -s /bin/sh myservice
+usermod -p '*' myservice             # no password, but not "locked" (sshd refuses locked accounts)
+loginctl enable-linger myservice     # its services run without a login session and start at boot
+install -d -m 700 -o myservice -g myservice ~myservice/.ssh
+echo 'restrict ssh-ed25519 AAAA... ci-deploy myservice' > ~myservice/.ssh/authorized_keys
+chown myservice: ~myservice/.ssh/authorized_keys && chmod 600 ~myservice/.ssh/authorized_keys
+```
+
+- Don't add the account to `sudo`/`wheel`. Use a fresh keypair per service.
+- `restrict` disables port/agent/X11 forwarding and PTYs for the CI key;
+  rsync and plain commands still work.
+- The target needs `rsync` and `bash` (`apk add rsync bash` on Alpine).
+- Keep state (e.g. a sqlite db) in the account's home **outside**
+  `~/<service_name>/` — that dir is rsynced with `--delete` on every deploy.
+
+The code lands in `~/<service_name>/`, the unit in
+`~/.config/systemd/user/<service_name>.service`. A repo can ship its own
+`.deploy/service.service` (a *user* unit: no `User=`,
+`WantedBy=default.target`); otherwise the template runs
+`bash ~/<service_name>/start.sh`. An executable `.deploy/build.sh` replaces
+the default "copy all tracked files" step and must fill `dist/`.
+
+Inspect on the target: `sudo -u myservice XDG_RUNTIME_DIR=/run/user/$(id -u myservice) systemctl --user status myservice`
+(or `journalctl _SYSTEMD_USER_UNIT=myservice.service` as root).
+
+## Public domain
+
+The action doesn't touch nginx or TLS (that needs root). Either:
+
+- **Reverse proxy, set up once by hand:** an nginx site proxying the domain
+  to the app's localhost port, plus `certbot --nginx -d <domain>`. certbot's
+  own timer renews it; nothing to redo per deploy.
+- **Tunnel** (e.g. Cloudflare Tunnel): `cloudflared` on the host connects
+  out, no open ports or certificates on the host — handy for a device on a
+  home LAN.
 
 ## Reaching a LAN-only device (e.g. a postmarketOS phone)
 
@@ -67,95 +109,17 @@ log on first boot, so you can pull them without SSHing in blind:
 
 Store `<deploy_host> ssh-ed25519 <key>` as the `deploy_host_key` secret.
 
-## Running without sudo (`user_service: true`) — preferred
-
-The safest setup gives CI no root at all: run the app as a systemd *user*
-service of a dedicated, unprivileged account. A leaked deploy key or a
-malicious commit then reaches only that account, not root and not your own
-login account.
-
-One-time, as root on the target (`myservice` = `service_name` = the account):
-
-```sh
-useradd -m -s /bin/sh myservice      # Alpine/postmarketOS: adduser -D -s /bin/sh myservice
-usermod -p '*' myservice             # no password, but not "locked" (sshd refuses locked accounts)
-loginctl enable-linger myservice     # keep its services running without a login session
-install -d -m 700 -o myservice -g myservice ~myservice/.ssh
-echo 'restrict ssh-ed25519 AAAA... ci-deploy' > ~myservice/.ssh/authorized_keys
-chown myservice: ~myservice/.ssh/authorized_keys && chmod 600 ~myservice/.ssh/authorized_keys
-```
-
-Don't add the account to `sudo`/`wheel`. `restrict` disables port, agent and
-X11 forwarding and PTYs for the CI key; rsync and plain commands still work.
-
-Then pass `deploy_user: myservice` and `user_service: true`. The unit goes to
-`~/.config/systemd/user/<service_name>.service` (repo's `.deploy/service.service`
-must then be a user unit: no `User=`, `WantedBy=default.target`; the fallback
-template already is). Keep state such as a sqlite db in the account's home,
-outside the deployed dir.
-
-`user_service` cannot be combined with `domain` (nginx/certbot need root).
-For a public site, set up nginx + certbot once by hand to proxy the domain to
-the app's port; certbot's timer handles renewals, so CI never needs to touch
-it again. Alternatively, expose the app with a tunnel (e.g. Cloudflare Tunnel)
-and skip nginx entirely.
-
-## Locking down sudo on the target (system services)
-
-The deploy user needs passwordless sudo for exactly the commands this
-action runs — not full sudo. On the target device (adjust `myservice`/paths
-to match your `service_name`/`domain`):
-
-```
-# /etc/sudoers.d/ci-deploy-myservice
-gvidasja ALL=(root) NOPASSWD: \
-  /usr/bin/install -m 644 /tmp/deploy-config/service.service /etc/systemd/system/myservice.service, \
-  /bin/systemctl daemon-reload, \
-  /bin/systemctl enable --now myservice, \
-  /bin/systemctl restart myservice
-```
-
-Only add the nginx/certbot lines if you're actually using a `domain` for
-this service:
-
-```
-  /usr/bin/install -m 644 -C /tmp/deploy-config/nginx.conf /etc/nginx/sites-available/example.com.conf, \
-  /usr/sbin/nginx -t, \
-  /bin/systemctl reload nginx, \
-  /usr/bin/certbot --nginx -d example.com *
-```
-
-`certbot --nginx` is the broadest line here (it can rewrite nginx config
-files via its plugin), and it does run on every deploy — deliberately.
-Each deploy re-installs the bare, HTTP-only `nginx.conf` fallback template,
-and it's certbot's own *installer* step (not just cert issuance) that adds
-the `listen 443 ssl` block and the HTTP→HTTPS redirect back in. Skipping
-certbot when a cert already exists leaves that block missing and takes the
-site down over HTTPS — don't gate it on cert existence. certbot itself
-already no-ops the actual reissuance when the existing cert isn't due for
-renewal, so re-running it is cheap; ongoing renewal is additionally handled
-by certbot's own installed timer, independent of this action.
-
-On postmarketOS (Alpine-based) you'll first need `apk add openssh rsync
-sudo`, and, if you want nginx/certbot, `apk add nginx certbot
-certbot-nginx`. Debian/GCE images ship openssh/rsync already; nginx/certbot
-are `apt install nginx certbot python3-certbot-nginx`.
-
 ## Inputs
 
 | Input | Required | Notes |
 |---|---|---|
-| `service_name` | yes | |
-| `domain` | no | Leave empty for LAN-only devices — nginx/certbot are skipped entirely. |
-| `port` | no | default `12345` |
-| `deploy_key` | yes | SSH private key |
-| `deploy_host` | yes | public IP/hostname works directly; LAN-only address needs `wireguard_config` first |
+| `service_name` | yes | unit name and `~/<service_name>/` dir |
+| `deploy_key` | yes | SSH private key of the service account |
+| `deploy_host` | yes | public IP/hostname works directly; LAN-only address needs `wireguard_config` |
 | `deploy_host_key` | no (recommended) | pinned `known_hosts` line(s); falls back to TOFU `ssh-keyscan` with a warning |
-| `deploy_user` | no | default `gvidasja` |
-| `deploy_email` | required if `domain` set | for certbot |
-| `env_file` | no | uploaded as `.env`, mode 600 |
-| `wireguard_config` | no | full `wg-quick` client config; omit if the runner already has LAN access |
-| `user_service` | no | `true` = systemd user service of `deploy_user`, no sudo (see above); not with `domain` |
+| `deploy_user` | no | defaults to `service_name` |
+| `env_file` | no | uploaded as `~/<service_name>/.env`, mode 600 |
+| `wireguard_config` | no | full `wg-quick` client config; omit if the runner already reaches the host |
 
 ## Example caller workflow
 
@@ -164,17 +128,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: gvidasja/ci/deploy@main
+      - uses: gvidasja/ci/deploy@master
         with:
           service_name: myservice
-          deploy_host: 10.0.0.9
+          deploy_host: ${{ secrets.DEPLOY_HOST }}
           deploy_host_key: ${{ secrets.DEPLOY_HOST_KEY }}
           deploy_key: ${{ secrets.DEPLOY_KEY }}
-          wireguard_config: ${{ secrets.WIREGUARD_CONFIG }}
-          env_file: ${{ secrets.APP_ENV }}
-          # domain/deploy_email omitted — this is a LAN-only deploy
+          env_file: ${{ secrets.ENV_FILE }}
+          # wireguard_config: ${{ secrets.WIREGUARD_CONFIG }}   # LAN-only targets
 ```
-
-For a publicly reachable target (e.g. GCE), drop `wireguard_config`, point
-`deploy_host` at the public IP, and add `domain`/`deploy_email` for nginx +
-certbot.
