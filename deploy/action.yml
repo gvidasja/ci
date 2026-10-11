@@ -148,7 +148,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        rsync -avz --delete -e "ssh -F ~/.ssh/deploy_config" \
+        rsync -avz --delete -e "ssh -F $HOME/.ssh/deploy_config" \
           ./dist/ "$DEPLOY_USER@${{ inputs.deploy_host }}:${{ inputs.service_name }}/"
 
     - name: Upload .env to server (if env_file is set)
@@ -156,7 +156,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        ssh -F ~/.ssh/deploy_config \
+        ssh -F $HOME/.ssh/deploy_config \
           "$DEPLOY_USER@${{ inputs.deploy_host }}" \
           "umask 177 && cat > ${{ inputs.service_name }}/.env" <<< "${{ inputs.env_file }}"
 
@@ -164,14 +164,14 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        rsync -avz --delete -e "ssh -F ~/.ssh/deploy_config" \
+        rsync -avz --delete -e "ssh -F $HOME/.ssh/deploy_config" \
           ./dist_config/ "$DEPLOY_USER@${{ inputs.deploy_host }}:.deploy-config/"
 
     - name: Install and restart user service
       shell: bash
       run: |
         set -euo pipefail
-        ssh -F ~/.ssh/deploy_config \
+        ssh -F $HOME/.ssh/deploy_config \
           "$DEPLOY_USER@${{ inputs.deploy_host }}" \
           bash -s -- "${{ inputs.service_name }}" <<'EOF'
           set -euo pipefail
